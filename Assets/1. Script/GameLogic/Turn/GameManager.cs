@@ -1,0 +1,443 @@
+using System;
+using UnityEngine;
+
+/// <summary>
+/// GameStateManager(턴/페이즈 진행)와 GameBoardState(보드 상태)를 실제로 이어붙이는 총괄 매니저.
+/// 페이즈가 바뀔 때마다 여기서 보드 상태를 조작하고(코스트 충전, 드로우, 전투 처리), 승패를 체크함.
+///
+/// 손패에서 카드를 골라 실제로 내는 처리(메인 페이즈 중 "카드 내기")는 UI/VR 입력이 있어야 하는
+/// 부분이라 여기 없음 — DemoTurnController.TryPlayCard가 이 GameManager를 통해 처리함.
+/// 카드 자체의 키워드 효과(회복/무기/앞의 적 피해/제거/강화 등)는 이 클래스의 Apply*/Reduce* 메서드로
+/// 노출해두고, "언제 그 메서드를 부를지"는 DemoTurnController(ResolveBattlecry/ResolveSpellEffect)가 정함.
+/// </summary>
+public class GameManager
+{
+    public GameStateManager State { get; } = new GameStateManager();
+    public GameBoardState Board { get; } = new GameBoardState();
+    public MatchRuleSet Rules { get; }
+    public event Action<PlayerSide, CardData> OnCardDrawn;
+    public event Action<PlayerSide, int> OnDrawRequested;
+    public event Action<PlayerSide, CardData> OnSpellCast;
+
+    // 게임이 끝났을 때 쏘는 이벤트. 이긴 쪽을 알려주고, 무승부면 null이 넘어옴
+    // (무승부는 "둘 다 필드+손+덱에 카드가 한 장도 없을 때 명치 맞은 횟수가 같은 경우"에만 발생 —
+    // resourceExhaustionDrawEnabled가 false인 모드(VR)에서는 이 무승부 조건 자체가 꺼져 있어서
+    // 명치를 FaceHitThreshold번 맞아야만 게임이 끝남)
+    public event Action<PlayerSide?> OnGameOver;
+
+    // 전투 페이즈(HandleCombat) 중 공격/피격이 실제로 일어난 시점을 알려주는 이벤트.
+    // GameManager는 MonoBehaviour가 아니라 비주얼(모션/애니메이션)을 직접 건드릴 수 없으므로,
+    // "누가/어느 라인에서" 공격했는지 또는 맞았는지만 알려주고, 실제 모션 재생은 비주얼을 들고 있는
+    // 쪽(DemoTurnController 등 구독자)이 맡음 — 애니메이션 클립/Animator 연결은 별도 작업
+    public event Action<PlayerSide, int> OnMinionAttacked; // 공격을 실행한 하수인 (side, laneIndex)
+    public event Action<PlayerSide, int> OnMinionHit;      // 피해를 입은 하수인 (side, laneIndex) — 반격으로 공격자가 맞는 경우도 포함
+    public event Action<PlayerSide> OnFaceHit;             // 명치를 맞은 쪽 (대응하는 하수인이 없는 경우)
+    public event Action<PlayerSide, int> OnWeaponEquipped;  // 무기를 장착한 쪽과 그 무기의 공격력 (EquipAndSwingWeapon 참고)
+
+    private bool isGameOver;
+    private bool skipInitialDraw;
+    public bool IsGameOver => isGameOver;
+
+    // 지금이 게임 전체에서 몇 번째 턴인지 (선공/후공 턴을 합쳐서 셈). 1이면 "첫 턴 공격 불가" 규칙이 적용됨
+    private int turnNumber = 1;
+    public int TurnNumber => turnNumber;
+
+    // resourceExhaustionDrawEnabled: "둘 다 필드+손+덱에 카드가 한 장도 없으면 무승부 판정"
+    // 규칙(CheckGameOver 참고)을 쓸지 여부. 데모(DemoTurnController)처럼 손패/덱이 실제로 있는
+    // 모드에서는 당연히 켜져 있어야 하지만, VR(VRGameSession)은 손패/덱 개념이 아예 없어서
+    // (물리 카드를 든 순간이 곧 손패) 이 조건이 "게임 시작 직후, 아직 아무도 카드를 안 낸 상태"
+    // 에서도 true가 되어버림 — End Turn 한 번만 눌러도 그 자리에서 무승부로 끝나버리는 버그가
+    // 있었음. VR에서는 생성 시 false로 꺼서 이 조건 자체를 아예 안 보게 함(기본값은 true라
+    // 데모 쪽 동작은 그대로 유지됨)
+    private readonly bool resourceExhaustionDrawEnabled;
+
+    public GameManager(bool resourceExhaustionDrawEnabled = true, MatchRuleSet rules = null)
+    {
+        Rules = rules ?? new MatchRuleSet();
+        this.resourceExhaustionDrawEnabled = resourceExhaustionDrawEnabled;
+        State.OnPhaseEnter += HandlePhaseEnter;
+        State.OnTurnChanged += _ => turnNumber++;
+    }
+
+    // 게임 시작. firstPlayer를 안 정해주면 50%로 랜덤하게 선공을 정함.
+    // 시작하자마자 TurnStart 처리(코스트/드로우)까지 끝내고 Main 페이즈에서 대기함
+    public void StartGame(PlayerSide? firstPlayer = null, bool dealCards = true)
+    {
+        isGameOver = false;
+        turnNumber = 1;
+        skipInitialDraw = !dealCards;
+
+        PlayerSide starter = firstPlayer ?? (UnityEngine.Random.value < 0.5f ? PlayerSide.Me : PlayerSide.Opponent);
+        PlayerSide second = starter == PlayerSide.Me ? PlayerSide.Opponent : PlayerSide.Me;
+
+        Board.GetBoard(starter).isSecondPlayer = false;
+        Board.GetBoard(starter).ownTurnCount = 0;
+        Board.GetBoard(second).isSecondPlayer = true;
+        Board.GetBoard(second).ownTurnCount = 0;
+        Board.me.maxHeroHealth = Board.opponent.maxHeroHealth = Rules.heroHealth;
+        Board.me.heroDamage = Board.opponent.heroDamage = 0;
+        Board.me.fatigueDamage = Board.opponent.fatigueDamage = 0;
+        if (dealCards)
+        {
+            DrawCards(PlayerSide.Me, Rules.openingHand);
+            DrawCards(PlayerSide.Opponent, Rules.openingHand);
+        }
+
+        State.StartGame(starter);
+
+        // TurnStart는 준비 단계일 뿐이라, 플레이어가 실제로 행동할 수 있는 Main 페이즈까지 바로 진행시킴
+        AdvanceToMain();
+    }
+
+    // 턴 종료 버튼에서 호출. 남은 페이즈(EndTurn, Combat)를 전부 진행시켜서
+    // 상대 턴의 Main 페이즈까지 한 번에 넘어감 (이 데모에서만 쓰는 간단한 흐름)
+    public void EndTurn()
+    {
+        if (isGameOver) return;
+        AdvanceToMain();
+    }
+
+    // 게임오버가 아니면, Main 페이즈에 도달할 때까지 페이즈를 계속 진행시킴.
+    // 반드시 최소 한 번은 AdvancePhase()를 호출해야 함 — EndTurn()에서 호출될 때는
+    // 이미 Main 페이즈인 상태로 들어오기 때문에, while로 조건부터 검사하면 아무 일도 안 일어남
+    // (버튼을 눌러도 턴이 전혀 안 넘어가던 버그의 원인이었음)
+    private void AdvanceToMain()
+    {
+        do
+        {
+            State.AdvancePhase();
+        }
+        while (!isGameOver && State.CurrentPhase != TurnPhase.Main);
+    }
+
+    private void HandlePhaseEnter(TurnPhase phase)
+    {
+        if (isGameOver) return;
+
+        switch (phase)
+        {
+            case TurnPhase.TurnStart:
+                HandleTurnStart();
+                break;
+            case TurnPhase.Combat:
+                HandleCombat();
+                break;
+        }
+    }
+
+    // 턴 시작: 코스트 충전하고, 카드 한 장 드로우하고, 공격 여부를 초기화함
+    private void HandleTurnStart()
+    {
+        var board = Board.GetBoard(State.CurrentPlayer);
+
+        board.ownTurnCount++;
+
+        // 선공: 본인 턴 횟수 = 코스트 (1, 2, 3, ...)
+        // 후공: 첫 턴부터 SecondPlayerStartingCost(2)로 시작해서 두 번째 턴까지 그대로 유지,
+        //       세 번째 턴부터는 선공과 같은 속도(1씩)로 증가
+        int baseCost = board.isSecondPlayer
+            ? Math.Max(board.ownTurnCount, GameRules.SecondPlayerStartingCost)
+            : board.ownTurnCount;
+
+        board.maxCost = Math.Min(baseCost, GameRules.MaxCost);
+        board.currentCost = board.maxCost;
+
+        foreach (var card in board.lanes)
+        {
+            if (card != null) card.hasAttackedThisTurn = false;
+        }
+
+        if (!(skipInitialDraw && turnNumber == 1)) DrawCards(State.CurrentPlayer, Rules.cardsPerTurn);
+    }
+
+    // 특정 편의 덱에서 카드 한 장을 손패로 가져옴. Draw 버튼 클릭 + 드로우 키워드(유닛/마법 공통)에서 호출됨.
+    // 덱이 비어있거나 게임이 끝났으면 아무 일도 안 하고 false를 돌려줌.
+    // 손패가 이미 GameRules.MaxHandSize만큼 가득 찼으면도 마찬가지로 false — 이때 카드는
+    // 사라지지 않고 그냥 덱에 남음(디자인 문서의 "손패" 규칙 그대로)
+    public bool TryDrawCard(PlayerSide side)
+    {
+        if (isGameOver) return false;
+
+        var board = Board.GetBoard(side);
+        if (board.hand.Count >= Rules.maxHandSize) return false;
+        if (board.deck.Count == 0)
+        {
+            if (Rules.fatigueOnEmptyDraw)
+            {
+                board.heroDamage += ++board.fatigueDamage;
+                CheckGameOver();
+            }
+            return false;
+        }
+
+        var drawn = board.deck[0];
+        board.deck.RemoveAt(0);
+        board.hand.Add(drawn);
+        OnCardDrawn?.Invoke(side, drawn);
+        return true;
+    }
+
+    public int DrawCards(PlayerSide side, int count)
+    {
+        if (count > 0 && !isGameOver) OnDrawRequested?.Invoke(side, count);
+        int drawn = 0;
+        for (int i = 0; i < count && !isGameOver; i++)
+            if (TryDrawCard(side)) drawn++;
+        return drawn;
+    }
+
+    public bool TryCastSpell(CardData card, PlayerSide side, int targetLane = -1, bool consumeHand = true, Action onConsumed = null)
+    {
+        if (card == null || card.cardType != CardType.Spell || isGameOver || State.CurrentPlayer != side) return false;
+        var board = Board.GetBoard(side);
+        var enemy = Board.GetOpponentBoard(side);
+        if (board.currentCost < card.cost || (consumeHand && !board.hand.Contains(card))) return false;
+        if (card.HasKeyword(CardKeyword.Remove) && !Rules.globalClear &&
+            (targetLane < 0 || targetLane >= enemy.lanes.Length || enemy.lanes[targetLane] == null)) return false;
+        if (consumeHand) board.hand.Remove(card);
+        board.currentCost -= card.cost;
+        onConsumed?.Invoke();
+        if (card.HasKeyword(CardKeyword.Heal)) ReduceFaceHitCount(side, Rules.healSpellAmount);
+        if (card.HasKeyword(CardKeyword.Draw)) DrawCards(side, card.HasKeyword(CardKeyword.Heal) ? 1 : Rules.drawSpellCards);
+        if (card.HasKeyword(CardKeyword.Remove))
+        {
+            if (Rules.globalClear)
+            {
+                DamageBoard(Board.me, Rules.removeSpellDamage);
+                DamageBoard(Board.opponent, Rules.removeSpellDamage);
+                CheckGameOver();
+            }
+            else ApplyDamageToLane(enemy.side, targetLane, Rules.removeSpellDamage);
+        }
+        if (card.HasKeyword(CardKeyword.Cleave))
+        {
+            for (int i = 0; i < enemy.lanes.Length; i++)
+            {
+                if (enemy.lanes[i] == null) continue;
+                enemy.lanes[i].TakeDamage(Rules.sweepSpellDamage);
+                OnMinionHit?.Invoke(enemy.side, i);
+            }
+            enemy.RemoveDeadCards();
+            CheckGameOver();
+        }
+        if (card.HasKeyword(CardKeyword.Buff)) ApplyTurnEndBuffToAllies(side, Rules.buffSpellAttack);
+        OnSpellCast?.Invoke(side, card);
+        return true;
+    }
+
+    private void DamageBoard(PlayerBoardState board, int amount)
+    {
+        for (int i = 0; i < board.lanes.Length; i++)
+        {
+            if (board.lanes[i] == null) continue;
+            board.lanes[i].TakeDamage(amount);
+            OnMinionHit?.Invoke(board.side, i);
+        }
+        board.RemoveDeadCards();
+    }
+
+    // 회복 키워드: side편 laneIndex 라인에 막 나온 카드가, 자기 "왼쪽"(laneIndex-1) 아군의 체력을
+    // amount만큼 회복시킴. 왼쪽에 라인이 없거나(맨 왼쪽) 왼쪽이 비어있으면 아무 일도 안 일어남.
+    // 원본 카드 체력(data.health)을 넘는 초과 회복은 안 되도록 막음
+    public void ApplyHealToLeftAlly(PlayerSide side, int laneIndex, int amount)
+    {
+        if (isGameOver) return;
+
+        var board = Board.GetBoard(side);
+        int leftIndex = laneIndex - 1;
+        if (leftIndex < 0) return;
+
+        var ally = board.lanes[leftIndex];
+        if (ally == null) return;
+
+        ally.currentHealth = Math.Min(ally.currentHealth + amount, ally.data.health);
+    }
+
+    // 앞의 적 피해 키워드: side편 laneIndex 라인에 막 나온 카드가, 상대의 "같은 라인"에 있는
+    // 적 하수인에게 amount만큼 피해를 줌. 정면에 적이 없으면 아무 일도 안 일어남(명치 피해 없음)
+    public void ApplyFrontDamage(PlayerSide side, int laneIndex, int amount)
+    {
+        if (isGameOver) return;
+
+        var defenderBoard = Board.GetOpponentBoard(side);
+        var target = defenderBoard.lanes[laneIndex];
+        if (target == null) return;
+
+        target.TakeDamage(amount);
+        defenderBoard.RemoveDeadCards();
+        CheckGameOver();
+    }
+
+    // 무기 키워드 전용: 플레이어(또는 VR에서 손으로 지목)가 직접 고른 대상(side편 laneIndex 라인)에게
+    // amount만큼 피해를 줌. ApplyFrontDamage와 달리 대상이 "누가 골랐든 이미 확정된 좌표"라서
+    // side를 상대 진영 그대로 받음 (호출부에서 이미 적 진영의 슬롯을 넘겨줌)
+    public void ApplyDamageToLane(PlayerSide side, int laneIndex, int amount)
+    {
+        if (isGameOver) return;
+
+        var board = Board.GetBoard(side);
+        var target = board.lanes[laneIndex];
+        if (target == null) return;
+
+        target.TakeDamage(amount);
+        board.RemoveDeadCards();
+        CheckGameOver();
+    }
+
+    // 무기 키워드 전용: wielderSide가 공격력(amount)만큼 데미지를 주는 무기를 장착하고, 장착과
+    // 동시에(플레이어가 이미 골라둔) 대상 하나(targetSide편 targetLaneIndex 라인)를 향해 즉시
+    // 한 번 휘둘러 피해를 줌. 대상 판정/사망 처리는 ApplyDamageToLane을 그대로 재사용함.
+    //
+    // 지금은 "장착 즉시 1회 소모"로 처리함 — 이 게임엔 아직 하수인 전투와 별개로 "플레이어가
+    // 무기로 직접 공격"하는 별도 턴/페이즈가 없어서, 여러 턴에 걸쳐 들고 있다가 나중에 쓰는
+    // 지속형 무기까지 만들려면 "무기를 언제/어떻게 쓸지" 정하는 입력 흐름이 새로 필요함.
+    // PlayerBoardState.weaponAttack 필드는 그 확장을 염두에 두고 남겨둠
+    public void EquipAndSwingWeapon(PlayerSide wielderSide, int amount, PlayerSide targetSide, int targetLaneIndex)
+    {
+        if (isGameOver) return;
+
+        var wielderBoard = Board.GetBoard(wielderSide);
+        wielderBoard.weaponAttack = amount;
+        OnWeaponEquipped?.Invoke(wielderSide, amount);
+
+        ApplyDamageToLane(targetSide, targetLaneIndex, amount);
+
+        wielderBoard.weaponAttack = 0;
+    }
+
+    // 마법 "강화" 전용: side편 필드에 지금 나와 있는 아군 하수인 전체의 공격력을 amount만큼 즉시 올림.
+    // 현재 규칙은 영구 강화. 이전 규칙 비교에서만 tempAttackBonus로 턴 종료 시 복구함.
+    public void ApplyTurnEndBuffToAllies(PlayerSide side, int amount)
+    {
+        if (isGameOver) return;
+
+        var board = Board.GetBoard(side);
+        foreach (var card in board.lanes)
+        {
+            if (card == null) continue;
+            card.currentAttack += amount;
+            if (!Rules.permanentBuff) card.tempAttackBonus += amount;
+        }
+    }
+
+    // 마법 "회복"(명치) 전용: side편이 지금까지 명치를 맞은 횟수를 amount만큼 줄임(0 밑으로는 안 내려감).
+    // 유닛의 회복 키워드(ApplyHealToLeftAlly, 왼쪽 아군 체력 회복)와는 이름만 같고 완전히 다른 효과임
+    public void ReduceFaceHitCount(PlayerSide side, int amount)
+    {
+        if (isGameOver) return;
+
+        var board = Board.GetBoard(side);
+        board.heroDamage = Math.Max(0, board.heroDamage - amount);
+    }
+
+    // 전투 페이즈: 현재 턴 플레이어의 4라인이 상대의 같은 라인을 공격.
+    // 상대 라인이 비어있으면 명치를 때림. 첫 턴에는 아예 공격이 일어나지 않음(그래도 강화 버프
+    // 정리/사망 카드 정리는 그대로 해야 해서 turnNumber==1이어도 메서드 끝까지는 진행함)
+    private void HandleCombat()
+    {
+        var attackerSide = State.CurrentPlayer;
+        var defenderSide = attackerSide == PlayerSide.Me ? PlayerSide.Opponent : PlayerSide.Me;
+
+        var attackerBoard = Board.GetBoard(attackerSide);
+        var defenderBoard = Board.GetOpponentBoard(attackerSide);
+
+
+        if (turnNumber != 1)
+        {
+            for (int i = 0; i < GameRules.LaneCount; i++)
+            {
+                var attacker = attackerBoard.lanes[i];
+                if (attacker == null || !attacker.IsAlive) continue;
+
+                // 공격이 확정된 시점 — 피해 계산 전에 쏴서, 구독하는 쪽이 "공격" 모션을 먼저
+                // 재생하고 그 다음에 피격 반응이 오도록 순서를 맞출 수 있게 함
+                OnMinionAttacked?.Invoke(attackerSide, i);
+
+                var defender = defenderBoard.lanes[i];
+                if (defender != null && defender.IsAlive)
+                {
+                    // 양쪽 공격력을 먼저 확정하고 함께 피해 적용. 이번 교전에서 죽어도 피해를 준다.
+                    int outgoing = attacker.currentAttack;
+                    int incoming = defender.currentAttack;
+                    bool retaliates = Rules.mutualMinionDamage || defender.data.HasKeyword(CardKeyword.Counter);
+                    defender.TakeDamage(outgoing);
+                    if (retaliates) attacker.TakeDamage(incoming);
+                    OnMinionHit?.Invoke(defenderSide, i);
+                    if (retaliates) OnMinionHit?.Invoke(attackerSide, i);
+                }
+                else
+                {
+                    defenderBoard.TakeFaceHit(Rules.attackDamageToHero ? attacker.currentAttack : 1);
+                    OnFaceHit?.Invoke(defenderSide);
+                    if (Rules.attackDamageToHero)
+                    {
+                        CheckGameOver();
+                        if (isGameOver) break;
+                    }
+                }
+
+                attacker.hasAttackedThisTurn = true;
+            }
+        }
+
+        // "강화" 마법으로 이번 턴에 붙은 임시 공격력은 이 턴의 전투 페이즈가 지나가면 사라짐
+        // (1턴째처럼 공격이 아예 없었어도 버프는 그대로 정리되어야 함)
+        foreach (var card in attackerBoard.lanes)
+        {
+            if (card != null && card.tempAttackBonus != 0)
+            {
+                card.currentAttack -= card.tempAttackBonus;
+                card.tempAttackBonus = 0;
+            }
+        }
+
+        attackerBoard.RemoveDeadCards();
+        defenderBoard.RemoveDeadCards();
+
+        CheckGameOver();
+    }
+
+    // 승패 체크. 우선순위:
+    // 1) 명치를 FaceHitThreshold번 맞은 쪽이 있으면 그 반대쪽이 승리
+    // 2) 둘 다 필드+손+덱에 카드가 한 장도 없으면, 명치를 덜 맞은(체력이 더 많이 남은) 쪽이 승리
+    //    (똑같이 맞았으면 무승부)
+    // public인 이유: 아직 "카드로 직접 공격" 로직이 없어서, 데모에서 명치 피해를 임의로 넣어보고
+    // (DemoTurnController의 디버그 버튼 등) 바로 승패 체크를 다시 돌려보기 위함
+    public void CheckGameOver()
+    {
+        if (isGameOver) return;
+
+        if (Board.me.IsDefeated)
+        {
+            EndGame(PlayerSide.Opponent);
+            return;
+        }
+        if (Board.opponent.IsDefeated)
+        {
+            EndGame(PlayerSide.Me);
+            return;
+        }
+
+        if (resourceExhaustionDrawEnabled && Board.me.HasNoCards && Board.opponent.HasNoCards)
+        {
+            if (Board.me.faceHitCount < Board.opponent.faceHitCount)
+            {
+                EndGame(PlayerSide.Me);
+            }
+            else if (Board.opponent.faceHitCount < Board.me.faceHitCount)
+            {
+                EndGame(PlayerSide.Opponent);
+            }
+            else
+            {
+                EndGame(null); // 무승부
+            }
+        }
+    }
+
+    private void EndGame(PlayerSide? winner)
+    {
+        isGameOver = true;
+        OnGameOver?.Invoke(winner);
+    }
+}
